@@ -2,6 +2,7 @@
 //! operator-configured command inside a real OS PTY. See `devdocs/PLAN-MVP0.md`.
 
 mod config;
+mod hostkey;
 mod logging;
 mod pty;
 mod server;
@@ -13,9 +14,11 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use clap::Parser;
 use russh::MethodSet;
-use russh::keys::{Algorithm, PrivateKey};
 use russh::server::Server as _;
 use tokio::net::TcpListener;
+use tokio::time::timeout;
+use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 use tracing::{info, warn};
 
 use crate::config::{Cli, Config};
@@ -40,10 +43,10 @@ async fn main() -> Result<()> {
         );
     }
 
-    // Ephemeral host key: regenerated every startup (PLAN §2). Clients that pinned
-    // a previous key will see a host-key-changed warning; acceptable for MVP0.
-    let host_key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519)
-        .context("failed to generate ephemeral ed25519 host key")?;
+    // Persistent host key: loaded from ~/.config/russhd-pty/ if present, else
+    // generated and saved there so it survives restarts (no host-key-changed
+    // warning for clients that pinned it).
+    let host_key = hostkey::load_or_generate()?;
 
     let russh_config = Arc::new(russh::server::Config {
         methods: MethodSet::all(),
@@ -63,19 +66,72 @@ async fn main() -> Result<()> {
         .with_context(|| format!("failed to bind {}", config.addr))?;
     info!(addr = %config.addr, "listening");
 
-    let mut server = Server::new(config.clone());
+    // Drives child teardown across ALL sessions: every session's cancel token is a
+    // child of this root, so cancelling it trips each supervisor's SIGHUP→grace→
+    // SIGKILL path at once — without waiting on per-connection handler drops.
+    let root_cancel = CancellationToken::new();
+    // Tracks the per-session supervisor tasks so shutdown can wait for the children
+    // to actually be reaped (or SIGKILLed) before the process exits.
+    let tracker = TaskTracker::new();
+
+    let mut server = Server::new(config.clone(), root_cancel.clone(), tracker.clone());
     let running = server.run_on_socket(russh_config, &listener);
     let shutdown = running.handle();
 
-    // Graceful shutdown on Ctrl-C / SIGINT.
-    tokio::spawn(async move {
-        if tokio::signal::ctrl_c().await.is_ok() {
+    // Graceful shutdown on SIGINT (Ctrl-C) or SIGTERM (service stop). Stop the
+    // accept loop and signal every live session to tear its child down.
+    {
+        let root_cancel = root_cancel.clone();
+        tokio::spawn(async move {
+            wait_for_shutdown_signal().await;
             info!("shutdown signal received");
             shutdown.shutdown("daemon shutting down".to_string());
-        }
-    });
+            root_cancel.cancel();
+        });
+    }
 
     running.await.context("server loop failed")?;
+
+    // The accept loop has stopped; make sure no children are left behind. Cancel
+    // (idempotent — the signal handler may have already done so) to cover a server
+    // loop that ended for some reason other than our signal handler, then wait for
+    // the supervisors to finish their teardown. Bound the wait so a wedged child
+    // (e.g. stuck in uninterruptible sleep after SIGKILL) can't hang shutdown.
+    root_cancel.cancel();
+    tracker.close();
+    let teardown_budget = config.grace + Duration::from_secs(2);
+    match timeout(teardown_budget, tracker.wait()).await {
+        Ok(()) => info!("all sessions terminated"),
+        Err(_) => warn!(
+            "timed out after {:?} waiting for sessions to terminate; some children may survive as orphans",
+            teardown_budget
+        ),
+    }
+
     info!("server stopped");
     Ok(())
+}
+
+/// Resolve once either SIGINT (Ctrl-C) or SIGTERM is received.
+async fn wait_for_shutdown_signal() {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    // If we can't install the SIGTERM handler, fall back to SIGINT only rather
+    // than aborting startup.
+    let mut sigterm = match signal(SignalKind::terminate()) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(error = %e, "failed to install SIGTERM handler; handling SIGINT only");
+            let _ = tokio::signal::ctrl_c().await;
+            return;
+        }
+    };
+    tokio::select! {
+        r = tokio::signal::ctrl_c() => {
+            if let Err(e) = r {
+                warn!(error = %e, "failed to listen for SIGINT");
+            }
+        }
+        _ = sigterm.recv() => {}
+    }
 }

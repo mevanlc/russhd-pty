@@ -14,6 +14,7 @@ use russh::server::{Auth, Handler, Msg, Server as ServerTrait, Session};
 use russh::{Channel, ChannelId, Disconnect};
 use tokio::io::unix::AsyncFd;
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 use tracing::{debug, error, info, warn};
 
 use crate::config::Config;
@@ -26,15 +27,24 @@ const DEFAULT_TERM: &str = "xterm";
 const DEFAULT_COLS: u16 = 80;
 const DEFAULT_ROWS: u16 = 24;
 
-/// russh server factory. One per daemon; clones config into each connection.
+/// russh server factory. One per daemon; clones shared state into each connection.
 #[derive(Clone)]
 pub struct Server {
     config: Arc<Config>,
+    /// Root of the session cancel-token tree; cancelled to tear down every
+    /// session's child at once on daemon shutdown.
+    root_cancel: CancellationToken,
+    /// Tracks session supervisor tasks so shutdown can await child teardown.
+    tracker: TaskTracker,
 }
 
 impl Server {
-    pub fn new(config: Arc<Config>) -> Self {
-        Self { config }
+    pub fn new(config: Arc<Config>, root_cancel: CancellationToken, tracker: TaskTracker) -> Self {
+        Self {
+            config,
+            root_cancel,
+            tracker,
+        }
     }
 }
 
@@ -47,6 +57,8 @@ impl ServerTrait for Server {
             config: self.config.clone(),
             peer,
             channels: HashMap::new(),
+            root_cancel: self.root_cancel.clone(),
+            tracker: self.tracker.clone(),
         }
     }
 
@@ -60,6 +72,10 @@ pub struct ClientHandler {
     config: Arc<Config>,
     peer: Option<std::net::SocketAddr>,
     channels: HashMap<ChannelId, ChannelState>,
+    /// Parent of every channel's cancel token; cancelled on daemon shutdown.
+    root_cancel: CancellationToken,
+    /// Shared tracker that the session supervisor tasks register with.
+    tracker: TaskTracker,
 }
 
 /// Per-channel session state.
@@ -75,12 +91,16 @@ struct ChannelState {
     slave: Option<OwnedFd>,
     /// Whether the shell command has been spawned for this channel.
     started: bool,
-    /// Cancelled when the client goes away; drives graceful child shutdown.
+    /// Cancelled when the client goes away **or** the daemon shuts down (it is a
+    /// child of the connection's `root_cancel`); drives graceful child shutdown.
     cancel: CancellationToken,
 }
 
 impl ChannelState {
-    fn new() -> Self {
+    /// `root` is the connection's shutdown token; this channel's `cancel` is a
+    /// child of it, so a daemon-wide shutdown trips every session at once while a
+    /// single client/channel close trips only its own token.
+    fn new(root: &CancellationToken) -> Self {
         Self {
             term: DEFAULT_TERM.to_string(),
             cols: DEFAULT_COLS,
@@ -90,7 +110,7 @@ impl ChannelState {
             master: None,
             slave: None,
             started: false,
-            cancel: CancellationToken::new(),
+            cancel: root.child_token(),
         }
     }
 
@@ -175,7 +195,8 @@ impl Handler for ClientHandler {
         _ssh: &mut Session,
     ) -> Result<bool, Self::Error> {
         debug!(channel = ?channel.id(), "session channel opened");
-        self.channels.insert(channel.id(), ChannelState::new());
+        self.channels
+            .insert(channel.id(), ChannelState::new(&self.root_cancel));
         Ok(true)
     }
 
@@ -202,10 +223,11 @@ impl Handler for ClientHandler {
         _modes: &[(russh::Pty, u32)],
         ssh: &mut Session,
     ) -> Result<(), Self::Error> {
+        let root = self.root_cancel.clone();
         let st = self
             .channels
             .entry(channel)
-            .or_insert_with(ChannelState::new);
+            .or_insert_with(|| ChannelState::new(&root));
         if !term.is_empty() {
             st.term = term.to_string();
         }
@@ -296,16 +318,19 @@ impl Handler for ClientHandler {
         let pid = child.id().unwrap_or(0);
         let stderr_read = AsyncFd::new(stderr_fd)?;
 
-        session::spawn(session::Session {
-            master,
-            child,
-            stderr_read,
-            handle,
-            channel,
-            cancel: st.cancel.clone(),
-            grace: self.config.grace,
-            pid,
-        });
+        session::spawn(
+            session::Session {
+                master,
+                child,
+                stderr_read,
+                handle,
+                channel,
+                cancel: st.cancel.clone(),
+                grace: self.config.grace,
+                pid,
+            },
+            &self.tracker,
+        );
         st.started = true;
 
         info!(channel = ?channel, pid, argv = ?self.config.argv, "shell started");

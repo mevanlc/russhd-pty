@@ -16,6 +16,7 @@ use std::os::unix::process::ExitStatusExt;
 use std::sync::Arc;
 use std::time::Duration;
 
+use nix::errno::Errno;
 use nix::sys::signal::{Signal, killpg};
 use nix::unistd::Pid;
 use russh::server::Handle;
@@ -25,6 +26,7 @@ use tokio::process::Child;
 use tokio::time::timeout;
 use tokio_util::bytes::Bytes;
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 use tracing::{debug, info, warn};
 
 /// Read buffer size for the PTY master pump.
@@ -53,7 +55,11 @@ pub struct Session {
 }
 
 /// Launch the session's pump + supervisor tasks. Returns immediately.
-pub fn spawn(s: Session) {
+///
+/// The supervisor is registered with `tracker` so daemon shutdown can wait for
+/// the child to be reaped (or killed) before exiting. The pumps are not tracked:
+/// they hold no process to reap and stop on their own when `cancel` trips.
+pub fn spawn(s: Session, tracker: &TaskTracker) {
     let Session {
         master,
         child,
@@ -72,7 +78,7 @@ pub fn spawn(s: Session) {
         cancel.clone(),
     ));
     tokio::spawn(pump_stderr_to_log(stderr_read, channel, cancel.clone()));
-    tokio::spawn(supervise(child, handle, channel, cancel, grace, pid));
+    tracker.spawn(supervise(child, handle, channel, cancel, grace, pid));
 }
 
 /// PTY master → client. Ends on EOF/`EIO` (child closed the PTY) or cancellation.
@@ -151,7 +157,6 @@ async fn supervise(
     grace: Duration,
     pid: u32,
 ) {
-    let pgid = Pid::from_raw(pid as i32);
     let mut wait = Box::pin(child.wait());
 
     tokio::select! {
@@ -172,8 +177,9 @@ async fn supervise(
             cancel.cancel();
         }
         _ = cancel.cancelled() => {
-            info!(channel = ?channel, pid, "client disconnected; sending SIGHUP to child group");
-            let _ = killpg(pgid, Signal::SIGHUP);
+            // Triggered by client/channel close or a daemon-wide shutdown.
+            info!(channel = ?channel, pid, "session cancelled; sending SIGHUP to child group");
+            kill_group(pid, Signal::SIGHUP, channel);
             match timeout(grace, &mut wait).await {
                 Ok(Ok(status)) => {
                     info!(channel = ?channel, pid, ?status, "child exited after SIGHUP");
@@ -181,13 +187,41 @@ async fn supervise(
                 Ok(Err(e)) => warn!(channel = ?channel, pid, error = %e, "waiting on child failed"),
                 Err(_) => {
                     warn!(channel = ?channel, pid, "child still alive after grace; sending SIGKILL");
-                    let _ = killpg(pgid, Signal::SIGKILL);
-                    let _ = wait.await;
+                    kill_group(pid, Signal::SIGKILL, channel);
+                    // Reap the corpse, but don't block forever: a process wedged in
+                    // uninterruptible sleep won't die even on SIGKILL until it wakes.
+                    // Bounding here keeps daemon shutdown from hanging on one child.
+                    match timeout(grace, &mut wait).await {
+                        Ok(_) => {}
+                        Err(_) => warn!(
+                            channel = ?channel, pid,
+                            "child unreaped after SIGKILL; abandoning (will be reaped by init on daemon exit)"
+                        ),
+                    }
                 }
             }
             let _ = handle.eof(channel).await;
             let _ = handle.close(channel).await;
         }
+    }
+}
+
+/// Signal the child's process group, treating "no such process" (already dead) as
+/// success. Refuses a `0` pid, which would target the *daemon's own* group.
+fn kill_group(pid: u32, sig: Signal, channel: ChannelId) {
+    if pid == 0 {
+        // child.id() yields None only once the child is reaped; a 0 here means we
+        // never had a usable pid. Signalling group 0 would hit our own group, so
+        // skip it — the bounded wait still reaps the direct child if it exits.
+        warn!(channel = ?channel, "no child pid; skipping group signal to avoid hitting the daemon");
+        return;
+    }
+    match killpg(Pid::from_raw(pid as i32), sig) {
+        Ok(()) => {}
+        Err(Errno::ESRCH) => {
+            debug!(channel = ?channel, pid, ?sig, "process group already gone");
+        }
+        Err(e) => warn!(channel = ?channel, pid, ?sig, error = %e, "killpg failed"),
     }
 }
 
