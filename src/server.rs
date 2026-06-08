@@ -167,17 +167,35 @@ fn pix(v: u32) -> u16 {
     v.min(u16::MAX as u32) as u16
 }
 
+impl ClientHandler {
+    /// Apply the username allow-list policy for an authentication attempt. Any
+    /// username is accepted unless `--allow-ssh-usernames` was given, in which
+    /// case only listed names pass; everyone else is rejected.
+    fn authorize(&self, user: &str, method: &str) -> Auth {
+        if self.config.username_allowed(user) {
+            info!(user, method, "auth accepted");
+            Auth::Accept
+        } else {
+            warn!(user, method, peer = ?self.peer, "auth rejected: username not in allow-list");
+            // No fallback methods: re-prompting under a different method can't
+            // change the username, so reject the connection outright.
+            Auth::Reject {
+                proceed_with_methods: None,
+                partial_success: false,
+            }
+        }
+    }
+}
+
 impl Handler for ClientHandler {
     type Error = anyhow::Error;
 
     async fn auth_none(&mut self, user: &str) -> Result<Auth, Self::Error> {
-        info!(user, method = "none", "auth accepted");
-        Ok(Auth::Accept)
+        Ok(self.authorize(user, "none"))
     }
 
     async fn auth_password(&mut self, user: &str, _password: &str) -> Result<Auth, Self::Error> {
-        info!(user, method = "password", "auth accepted");
-        Ok(Auth::Accept)
+        Ok(self.authorize(user, "password"))
     }
 
     async fn auth_publickey(
@@ -185,8 +203,7 @@ impl Handler for ClientHandler {
         user: &str,
         _key: &russh::keys::ssh_key::PublicKey,
     ) -> Result<Auth, Self::Error> {
-        info!(user, method = "publickey", "auth accepted");
-        Ok(Auth::Accept)
+        Ok(self.authorize(user, "publickey"))
     }
 
     async fn auth_keyboard_interactive<'a>(
@@ -195,8 +212,7 @@ impl Handler for ClientHandler {
         _submethods: &str,
         _response: Option<russh::server::Response<'a>>,
     ) -> Result<Auth, Self::Error> {
-        info!(user, method = "keyboard-interactive", "auth accepted");
-        Ok(Auth::Accept)
+        Ok(self.authorize(user, "keyboard-interactive"))
     }
 
     async fn channel_open_session(

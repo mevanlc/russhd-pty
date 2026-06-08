@@ -31,11 +31,19 @@ async fn main() -> Result<()> {
 
     let config = Arc::new(Config::from_cli(cli)?);
 
-    // Loud, unconditional reminder: this daemon authenticates no one.
-    warn!(
-        "AUTHENTICATION DISABLED: any client reaching {} can run {:?}",
-        config.addr, config.argv
-    );
+    // Loud, unconditional reminder: this daemon verifies no credentials. An
+    // allow-list (if set) only restricts *which usernames* may connect — it does
+    // not authenticate them (any password/key is accepted for a listed name).
+    match &config.allowed_usernames {
+        Some(allowed) => warn!(
+            "NO CREDENTIAL CHECK: any client reaching {} with a username in {:?} can run {:?}",
+            config.addr, allowed, config.argv
+        ),
+        None => warn!(
+            "AUTHENTICATION DISABLED: any client reaching {} can run {:?}",
+            config.addr, config.argv
+        ),
+    }
     if !config.addr.ip().is_loopback() {
         warn!(
             "binding non-loopback address {} — the configured command is exposed to the network",
