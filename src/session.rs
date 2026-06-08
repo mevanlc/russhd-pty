@@ -22,9 +22,9 @@ use nix::unistd::Pid;
 use russh::server::Handle;
 use russh::{ChannelId, Sig};
 use tokio::io::unix::AsyncFd;
+use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::process::Child;
 use tokio::time::timeout;
-use tokio_util::bytes::Bytes;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use tracing::{debug, info, warn};
@@ -38,6 +38,9 @@ const STDERR_BUF: usize = 8 * 1024;
 pub struct Session {
     /// PTY master, shared with the connection handler (which writes client input).
     pub master: Arc<AsyncFd<OwnedFd>>,
+    /// Flow-controlled writer to the client (respects the SSH channel window, so a
+    /// fast PTY producer can't grow russh's outbound buffer without bound).
+    pub writer: Box<dyn AsyncWrite + Send + Unpin>,
     /// The child process attached to the PTY.
     pub child: Child,
     /// Read end of the child's stderr pipe (non-blocking).
@@ -62,6 +65,7 @@ pub struct Session {
 pub fn spawn(s: Session, tracker: &TaskTracker) {
     let Session {
         master,
+        writer,
         child,
         stderr_read,
         handle,
@@ -73,7 +77,7 @@ pub fn spawn(s: Session, tracker: &TaskTracker) {
 
     tokio::spawn(pump_master_to_client(
         master,
-        handle.clone(),
+        writer,
         channel,
         cancel.clone(),
     ));
@@ -82,9 +86,14 @@ pub fn spawn(s: Session, tracker: &TaskTracker) {
 }
 
 /// PTY master → client. Ends on EOF/`EIO` (child closed the PTY) or cancellation.
+///
+/// Writes go through the channel's flow-controlled `writer`: when the client's
+/// receive window is exhausted, `write_all` blocks rather than letting russh
+/// buffer the overflow unboundedly. That stalls these PTY reads, the kernel PTY
+/// buffer fills, and a fast producer is throttled to the client's drain rate.
 async fn pump_master_to_client(
     master: Arc<AsyncFd<OwnedFd>>,
-    handle: Handle,
+    mut writer: Box<dyn AsyncWrite + Send + Unpin>,
     channel: ChannelId,
     cancel: CancellationToken,
 ) {
@@ -95,8 +104,9 @@ async fn pump_master_to_client(
             r = read_fd(&master, &mut buf) => match r {
                 Ok(0) => break,
                 Ok(n) => {
-                    if handle.data(channel, Bytes::copy_from_slice(&buf[..n])).await.is_err() {
-                        // Client channel is gone; nothing more to send.
+                    if let Err(e) = writer.write_all(&buf[..n]).await {
+                        // Client channel/window writer is gone; nothing more to send.
+                        debug!(channel = ?channel, error = %e, "client write failed; ending pump");
                         break;
                     }
                 }

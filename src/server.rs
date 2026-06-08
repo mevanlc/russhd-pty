@@ -12,6 +12,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use russh::server::{Auth, Handler, Msg, Server as ServerTrait, Session};
 use russh::{Channel, ChannelId, Disconnect};
+use tokio::io::AsyncWrite;
 use tokio::io::unix::AsyncFd;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
@@ -89,6 +90,14 @@ struct ChannelState {
     master: Option<Arc<AsyncFd<OwnedFd>>>,
     /// PTY slave, held until consumed by the child at `shell_request`.
     slave: Option<OwnedFd>,
+    /// Flow-controlled writer to the client, derived from the `Channel` at open.
+    ///
+    /// Writing through this (rather than `Handle::data`) respects the SSH channel
+    /// window: when the client's receive window is exhausted, the write blocks
+    /// instead of letting russh buffer the overflow in its unbounded per-channel
+    /// `pending_data` queue. That backpressure propagates to the PTY and throttles
+    /// a fast producer (e.g. a full-screen TUI) to the client's drain rate.
+    writer: Option<Box<dyn AsyncWrite + Send + Unpin>>,
     /// Whether the shell command has been spawned for this channel.
     started: bool,
     /// Cancelled when the client goes away **or** the daemon shuts down (it is a
@@ -109,6 +118,7 @@ impl ChannelState {
             pixh: 0,
             master: None,
             slave: None,
+            writer: None,
             started: false,
             cancel: root.child_token(),
         }
@@ -195,8 +205,13 @@ impl Handler for ClientHandler {
         _ssh: &mut Session,
     ) -> Result<bool, Self::Error> {
         debug!(channel = ?channel.id(), "session channel opened");
-        self.channels
-            .insert(channel.id(), ChannelState::new(&self.root_cancel));
+        let mut st = ChannelState::new(&self.root_cancel);
+        // Capture the flow-controlled writer now, then let `channel` drop: its
+        // receiver closes so incoming client data flows only through `data()`
+        // below (no double-delivery), while the writer keeps working — it owns
+        // clones of the session sender and window refs and is `'static`.
+        st.writer = Some(Box::new(channel.make_writer()));
+        self.channels.insert(channel.id(), st);
         Ok(true)
     }
 
@@ -306,6 +321,14 @@ impl Handler for ClientHandler {
         let slave = st.slave.take().expect("ensure_pty set slave");
         let master = st.master.clone().expect("ensure_pty set master");
         let term = st.term.clone();
+        let writer = match st.writer.take() {
+            Some(w) => w,
+            None => {
+                error!(channel = ?channel, "no client writer for channel (channel never opened?)");
+                let _ = ssh.channel_failure(channel);
+                return Ok(());
+            }
+        };
 
         let (child, stderr_fd) = match pty::spawn_child(&self.config.argv, &term, slave) {
             Ok(v) => v,
@@ -321,6 +344,7 @@ impl Handler for ClientHandler {
         session::spawn(
             session::Session {
                 master,
+                writer,
                 child,
                 stderr_read,
                 handle,
@@ -362,12 +386,17 @@ impl Handler for ClientHandler {
         data: &[u8],
         _ssh: &mut Session,
     ) -> Result<(), Self::Error> {
-        if let Some(st) = self.channels.get(&channel)
-            && let Some(master) = &st.master
-            && let Err(e) = session::write_all_fd(master, data).await
-        {
+        // Clone out the master handle (cheap Arc bump) and release the borrow on
+        // `ChannelState` *before* awaiting: holding `&ChannelState` across the
+        // await would require it to be `Sync`, which the boxed writer is not.
+        let Some(master) = self.channels.get(&channel).and_then(|st| st.master.clone()) else {
+            return Ok(());
+        };
+        if let Err(e) = session::write_all_fd(&master, data).await {
             warn!(channel = ?channel, error = %e, "write to PTY failed; shutting down session");
-            st.cancel.cancel();
+            if let Some(st) = self.channels.get(&channel) {
+                st.cancel.cancel();
+            }
         }
         Ok(())
     }
