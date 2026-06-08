@@ -1,0 +1,17 @@
+[package]
+name = "russhd-pty"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.102"
+clap = { version = "4", features = ["derive"] }
+libc = "0.2.186"
+nix = { version = "0.31", features = ["term", "process", "signal", "fs", "ioctl"] }
+rand = { version = "0.10", features = ["thread_rng"] }
+russh = "0.61"
+shlex = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "process", "time", "signal", "sync"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
